@@ -1,67 +1,57 @@
 import { withAuth } from '../../../lib/middleware';
-import { readExcel, writeExcel, mergeRecords, generateTemplate } from '../../../services/excelService';
+import { getParticipants, saveParticipants, getReminderLogs } from '../../../lib/store';
 import { getStats } from '../../../services/reminderService';
-import { getReminderLogs } from '../../../lib/store';
-import path from 'path';
-import fs from 'fs';
-
-const DATA_DIR = process.env.DATA_DIR || './data';
-const MASTER_PATH = path.join(DATA_DIR, 'master.xlsx');
 
 async function handler(req, res) {
   if (req.method === 'GET') {
-    const { action, page = 1, limit = 50, search = '', status = '' } = req.query;
+    const { action, page = 1, limit = 50, search = '', status = '', type = '' } = req.query;
 
     if (action === 'stats') {
-      const stats = getStats();
-      return res.status(200).json(stats);
+      try {
+        const stats = getStats();
+        return res.status(200).json(stats);
+      } catch (e) {
+        return res.status(200).json({ total: 0, preCompleted: 0, prePending: 0, postCompleted: 0, postPending: 0, managerCompleted: 0, managerPending: 0, pendingPostReminders: 0, pendingManagerReminders: 0 });
+      }
     }
 
     if (action === 'logs') {
-      const logs = getReminderLogs();
-      return res.status(200).json(logs.slice(0, 200));
-    }
-
-    if (action === 'download') {
-      if (!fs.existsSync(MASTER_PATH)) {
-        return res.status(404).json({ error: 'No data file found' });
+      try {
+        const logs = getReminderLogs();
+        // Filter by type if provided
+        const filtered = type ? logs.filter(l => l.type === type) : logs;
+        return res.status(200).json(filtered.slice(0, 500));
+      } catch {
+        return res.status(200).json([]);
       }
-      const buffer = fs.readFileSync(MASTER_PATH);
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', 'attachment; filename=participants.xlsx');
-      return res.status(200).send(buffer);
     }
 
-    if (action === 'template') {
-      const filePath = generateTemplate();
-      const buffer = fs.readFileSync(filePath);
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', 'attachment; filename=template.xlsx');
-      return res.status(200).send(buffer);
+    if (action === 'export') {
+      const data = getParticipants();
+      return res.status(200).json(data);
     }
 
-    // Return paginated + filtered participants
-    let data = readExcel(MASTER_PATH);
+    // Paginated participant list
+    let data = getParticipants();
 
     if (search) {
       const q = search.toLowerCase();
-      data = data.filter(
-        (r) =>
-          r.Name?.toLowerCase().includes(q) ||
-          r.Email?.toLowerCase().includes(q) ||
-          r['Training Name']?.toLowerCase().includes(q)
+      data = data.filter(r =>
+        (r.Name || '').toLowerCase().includes(q) ||
+        (r.Email || '').toLowerCase().includes(q) ||
+        (r['Training Name'] || '').toLowerCase().includes(q)
       );
     }
 
     if (status) {
-      data = data.filter((r) => {
-        if (status === 'pre-pending') return r['Pre Status']?.toLowerCase() !== 'yes';
-        if (status === 'post-pending') return r['Post Status']?.toLowerCase() !== 'yes';
-        if (status === 'manager-pending') return r['Manager Status']?.toLowerCase() !== 'yes';
+      data = data.filter(r => {
+        if (status === 'pre-pending') return (r['Pre Status'] || '').toLowerCase() !== 'yes';
+        if (status === 'post-pending') return (r['Post Status'] || '').toLowerCase() !== 'yes';
+        if (status === 'manager-pending') return (r['Manager Status'] || '').toLowerCase() !== 'yes';
         if (status === 'completed') return (
-          r['Pre Status']?.toLowerCase() === 'yes' &&
-          r['Post Status']?.toLowerCase() === 'yes' &&
-          r['Manager Status']?.toLowerCase() === 'yes'
+          (r['Pre Status'] || '').toLowerCase() === 'yes' &&
+          (r['Post Status'] || '').toLowerCase() === 'yes' &&
+          (r['Manager Status'] || '').toLowerCase() === 'yes'
         );
         return true;
       });
@@ -71,34 +61,67 @@ async function handler(req, res) {
     const pageNum = parseInt(page);
     const limitNum = parseInt(limit);
     const paginated = data.slice((pageNum - 1) * limitNum, pageNum * limitNum);
-
     return res.status(200).json({ data: paginated, total, page: pageNum, limit: limitNum });
   }
 
+  if (req.method === 'POST') {
+    // Add single participant
+    const record = req.body;
+    const data = getParticipants();
+    const key = `${(record.Email || '').toLowerCase()}|${record['Training Name']}`;
+    const idx = data.findIndex(r => `${r.Email}|${r['Training Name']}` === key);
+    const normalized = normalizeRecord(record);
+    if (idx >= 0) {
+      data[idx] = { ...data[idx], ...normalized };
+    } else {
+      data.push(normalized);
+    }
+    saveParticipants(data);
+    return res.status(200).json({ success: true });
+  }
+
   if (req.method === 'PUT') {
-    // Update single participant
     const { email, trainingName, updates } = req.body;
-    const data = readExcel(MASTER_PATH);
-    const idx = data.findIndex(
-      (r) => r.Email === email && r['Training Name'] === trainingName
-    );
-    if (idx === -1) return res.status(404).json({ error: 'Record not found' });
+    const data = getParticipants();
+    const idx = data.findIndex(r => r.Email === email && r['Training Name'] === trainingName);
+    if (idx === -1) return res.status(404).json({ error: 'Not found' });
     data[idx] = { ...data[idx], ...updates };
-    writeExcel(data, MASTER_PATH);
+    saveParticipants(data);
     return res.status(200).json({ success: true });
   }
 
   if (req.method === 'DELETE') {
     const { email, trainingName } = req.body;
-    let data = readExcel(MASTER_PATH);
-    data = data.filter(
-      (r) => !(r.Email === email && r['Training Name'] === trainingName)
-    );
-    writeExcel(data, MASTER_PATH);
+    let data = getParticipants();
+    data = data.filter(r => !(r.Email === email && r['Training Name'] === trainingName));
+    saveParticipants(data);
     return res.status(200).json({ success: true });
   }
 
   return res.status(405).end();
+}
+
+function normalizeRecord(row) {
+  return {
+    Name: row['Name'] || row['name'] || '',
+    Email: (row['Email'] || row['email'] || '').toLowerCase().trim(),
+    'Manager Email': (row['Manager Email'] || row['manager_email'] || row['ManagerEmail'] || '').toLowerCase().trim(),
+    'Training Name': row['Training Name'] || row['training_name'] || row['TrainingName'] || '',
+    'Training Date': row['Training Date'] || row['training_date'] || row['TrainingDate'] || '',
+    'Pre Status': row['Pre Status'] || row['pre_status'] || '',
+    'Post Status': row['Post Status'] || row['post_status'] || '',
+    'Manager Status': row['Manager Status'] || row['manager_status'] || '',
+    'Pre Link': row['Pre Link'] || row['pre_link'] || '',
+    'Post Link': row['Post Link'] || row['post_link'] || '',
+    'Manager Link': row['Manager Link'] || row['manager_link'] || '',
+    'Last Pre Sent': row['Last Pre Sent'] || '',
+    'Last Post Sent': row['Last Post Sent'] || '',
+    'Last Manager Sent': row['Last Manager Sent'] || '',
+    'Pre Count': parseInt(row['Pre Count'] || 0),
+    'Post Count': parseInt(row['Post Count'] || 0),
+    'Manager Count': parseInt(row['Manager Count'] || 0),
+    Notes: row['Notes'] || '',
+  };
 }
 
 export default withAuth(handler);
